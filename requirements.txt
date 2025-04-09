@@ -5,3 +5,4 @@ python-dotenv
 requests
 jinja2
 pysnmp
+python-multipart

@@ -72,8 +72,50 @@ class SnipeConnect:
             "rows": all_rows
         })
 
-        
+    def consumables_search(self,url, term):
+        all_rows = []
+        page = 1
+        limit = 100
+        total_pages = None
 
+        while True:
+            endpoint = f"{url}?search={term}&limit={limit}&page={page}"
+            data = self.get(endpoint)
+
+            if not data:
+                break
+
+            json_data = json.loads(data)
+
+            # Only calculate total_pages once
+            if total_pages is None:
+                total_items = json_data.get("total", 0)
+                total_pages = math.ceil(total_items / limit)
+                if total_pages == 0:
+                    break
+
+            rows = json_data.get("rows", [])
+            all_rows.extend(rows)
+
+            if page >= total_pages:
+                break
+
+            page += 1
+
+        return json.dumps({
+            "total": len(all_rows),
+            "rows": all_rows
+        })
+    def consumables_stock(self, id):
+        url = "/consumables"
+
+        endpoint = f"{url}/{id}"
+        data = self.get(endpoint)
+
+        if not data:
+            return {"Error": "No Data"}
+
+        return data
 if __name__ == '__main__':
     conn = SnipeConnect(SNIPEIT_API_KEY,SNIPEIT_BASE_URL)
     conn.search("/hardware","Printer")

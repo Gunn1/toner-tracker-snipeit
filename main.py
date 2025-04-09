@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Form
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import create_engine, Column, Integer, String, Date, ForeignKey
@@ -10,6 +10,12 @@ import snipeit
 import json
 from typing import List
 from fastapi import Depends
+import json
+CONFIG_FILE = "consumables_mapping.config"
+def load_printer_settings(file_path="consumables_mapping.config"):
+    with open(file_path, "r") as f:
+        config = json.load(f)
+    return config.get("PREDEFINED_CONSUMABLES", {})
 # Load environment variables
 load_dotenv()
 
@@ -41,14 +47,15 @@ class TonerModel(Base):
     consumables = relationship("Consumable", back_populates="toner_model")
 class Consumable(Base):
     __tablename__ = "consumables"
-
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
-    type = Column(String)  # e.g. "Drum", "Fuser", "Waste Toner Box"
+    type = Column(String)  # e.g. Toner, Drum, etc.
     part_number = Column(String)
+    snipeit_asset_id = Column(String, nullable=True)  # new field for Snipe‑IT asset ID
     toner_model_id = Column(Integer, ForeignKey("toner_models.id"))
 
     toner_model = relationship("TonerModel", back_populates="consumables")
+
 
 class ConsumableSchema(BaseModel):
     id: int
@@ -76,6 +83,7 @@ class PrinterSchema(BaseModel):
     id: int
     asset_tag: str
     name: str
+    user: Optional[str]
     location: Optional[str]
     ip_address: Optional[str]
     toner_model: TonerModelSchema
@@ -92,6 +100,7 @@ class Printer(Base):
     name = Column(String, index=True)
     location = Column(String)
     ip_address = Column(String)
+    user = Column(String)
     toner_model_id = Column(Integer, ForeignKey("toner_models.id"))
 
     toner_model = relationship("TonerModel")
@@ -115,6 +124,34 @@ def get_db():
 # Printers Snipe-IT 
 # Get Toner For those printers
 # Trying to get supply levels for those printers and there location, status and who uses that printer.
+def sync_consumables_with_snipeit(snipeconn: snipeit.SnipeConnect, db: Session):
+    consumables = db.query(Consumable).all()
+    for consumable in consumables:
+        # Use the part number as the search query.
+        search_query = consumable.part_number
+        response = snipeconn.consumables_search("/consumables", search_query)
+        data = json.loads(response)
+        print(data)
+        rows = data.get("rows", [])
+        matched_asset = None
+        
+        for asset in rows:
+            # Get the model info from the asset.
+            model_number = asset.get("model_number")
+            # Compare the asset's model number with the consumable's part number.
+            if model_number == search_query:
+                matched_asset = asset
+                break
+        
+        if matched_asset:
+            consumable.snipeit_asset_id = matched_asset.get("id")
+            print(f"Linked {consumable.name} (Part: {consumable.part_number}) with Snipe‑IT asset ID {consumable.snipeit_asset_id}")
+        else:
+            print(f"No Snipe‑IT asset found for {consumable.name} with part {consumable.part_number}")
+    
+    db.commit()
+
+
 def get_all_printers(snipeconn: snipeit.SnipeConnect):
     all_rows = []
     page = 1
@@ -131,38 +168,38 @@ def get_all_printers(snipeconn: snipeit.SnipeConnect):
         page += 1
 
     return all_rows
+def load_config():
+    with open(CONFIG_FILE, "r") as f:
+        return json.load(f)
 
+def save_config(config: dict):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+
+@app.get("/config", response_class=HTMLResponse)
+async def edit_config_page(request: Request):
+    config = load_config()
+    # Convert config to formatted JSON string
+    config_str = json.dumps(config, indent=4)
+    return templates.TemplateResponse("edit_config.html", {"request": request, "config": config_str})
+
+@app.post("/config", response_class=HTMLResponse)
+async def update_config(request: Request, config_data: str = Form(...)):
+    try:
+        updated_config = json.loads(config_data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
+    
+    save_config(updated_config)
+    message = "Configuration updated successfully."
+    # Return the updated JSON string in the form.
+    config_str = json.dumps(updated_config, indent=4)
+    return templates.TemplateResponse("edit_config.html", {"request": request, "config": config_str, "message": message})
 
 snipeconn = snipeit.SnipeConnect(SNIPEIT_API_KEY,SNIPEIT_BASE_URL)
 def sync_printers_from_snipeit(snipeconn: snipeit.SnipeConnect, db: Session):
     # Optional: Predefined consumables by printer model
-    PREDEFINED_CONSUMABLES = {
-        "HP Color LaserJet M255dw": [
-        {
-            "name": "HP 206X High Yield Black Original LaserJet Toner Cartridge",
-            "type": "Toner",
-            "part_number": "W2110X"
-        },
-        {
-            "name": "HP 206X High Yield Magenta Original LaserJet Toner Cartridge",
-            "type": "Toner",
-            "part_number": "W2113X"
-        },
-        {
-            "name": "HP 206X High Yield Cyan Original LaserJet Toner Cartridge",
-            "type": "Toner",
-            "part_number": "W2111X"
-        },
-        {
-            "name": "HP 206X High Yield Yellow Original LaserJet Toner Cartridge",
-            "type": "Toner",
-            "part_number": "W2112X"
-        }
-    ],
-        "HP LaserJet P2055dn": [
-            {"name": "Maintenance Kit", "type": "Kit", "part_number": "CE255A-KIT"}
-        ]
-    }
+    PREDEFINED_CONSUMABLES = load_printer_settings()
 
     for model_name, consumables in PREDEFINED_CONSUMABLES.items():
         toner_model = db.query(TonerModel).filter_by(printer_model=model_name).first()
@@ -206,6 +243,12 @@ def sync_printers_from_snipeit(snipeconn: snipeit.SnipeConnect, db: Session):
         ip_address = item.get("custom_fields", {}).get("IP Address", {}).get("value", "")
         model_name = item.get("model", {}).get("name")
         asset_tag = item.get("asset_tag")
+        assigned_to = item.get("assigned_to")
+        if assigned_to and isinstance(assigned_to, dict) and assigned_to.get("type") == "user":
+            user = assigned_to.get("name", "")
+        else:
+            user = ""
+
 
         if not asset_tag or not model_name:
             print(f"Skipping invalid printer (missing asset_tag or model): {item}")
@@ -227,6 +270,7 @@ def sync_printers_from_snipeit(snipeconn: snipeit.SnipeConnect, db: Session):
             printer.name = name
             printer.location = location
             printer.ip_address = ip_address
+            printer.user = user
             printer.toner_model_id = toner_model.id
         else:
             printer = Printer(
@@ -241,6 +285,13 @@ def sync_printers_from_snipeit(snipeconn: snipeit.SnipeConnect, db: Session):
     db.commit()
     print(f"Total printers in session: {db.query(Printer).count()}")
 
+@app.post("/sync-consumables")
+def trigger_sync_consumables(db: Session = Depends(get_db)):
+    try:
+        sync_consumables_with_snipeit(snipeconn, db)
+        return {"message": "Consumables synced with Snipe‑IT successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/sync-printers")
 def trigger_sync(db: Session = Depends(get_db)):
@@ -263,7 +314,24 @@ def count_printers(db: Session = Depends(get_db)):
 @app.get("/printers/view", response_class=HTMLResponse)
 def view_printers(request: Request, db: Session = Depends(get_db)):
     printers = db.query(Printer).all()
-    return templates.TemplateResponse("printers.html", {
-        "request": request,
-        "printers": printers
-    })
+    for printer in printers:
+        print(printer.user)
+        if printer.toner_model:
+            for consumable in printer.toner_model.consumables:
+                if consumable.snipeit_asset_id:
+                    consumable.stock = get_stock(snipeconn, consumable.snipeit_asset_id)
+                else:
+                    consumable.stock = "N/A"
+    return templates.TemplateResponse("printers.html", {"request": request, "printers": printers})
+
+
+def get_stock(snipeconn: snipeit.SnipeConnect, asset_id: str):
+    try:
+        response = snipeconn.consumables_stock(asset_id)
+        data = json.loads(response)
+        # Adjust the following to match your actual API structure.
+        stock = data.get("remaining", "N/A")
+        return stock
+    except Exception as e:
+        print(f"Error getting stock for asset {asset_id}: {str(e)}")
+        return "Error"
